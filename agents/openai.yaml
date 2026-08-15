@@ -1,0 +1,4 @@
+interface:
+  display_name: "Remote Computer"
+  short_description: "Provision tracked AWS or GCP development VMs"
+  default_prompt: "Use $remote-computer to provision a remote development VM and prepare SSH access."
