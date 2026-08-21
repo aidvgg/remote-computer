@@ -19,6 +19,9 @@ class SkillContentTests(unittest.TestCase):
             "create-key",
             "~/.vms.json",
             "vm_bookkeeper.py sync",
+            "github-discover --verify-ssh",
+            "github_auth",
+            "references/github.md",
             "pbcopy",
             "wl-copy",
             "Create these cloud resources now?",
@@ -37,6 +40,13 @@ class SkillContentTests(unittest.TestCase):
         self.assertIn("https://docs.aws.amazon.com/", aws)
         self.assertIn("https://cloud.google.com/", gcp)
         self.assertNotIn("0.0.0.0/0", aws + gcp)
+
+    def test_github_reference_preserves_key_roles(self):
+        github = (ROOT / "references" / "github.md").read_text()
+        self.assertIn("GitHub authentication", github)
+        self.assertIn("Commit signing", github)
+        self.assertIn("github-upload-key", github)
+        self.assertIn("Never replace or remove signing configuration", github)
 
     def test_default_prompt_names_skill(self):
         metadata = (ROOT / "agents" / "openai.yaml").read_text()

@@ -19,6 +19,8 @@ class InstallerTests(unittest.TestCase):
             installed = skills / "remote-computer"
             self.assertTrue((installed / "SKILL.md").is_file())
             self.assertTrue((installed / "scripts" / "vm_bookkeeper.py").is_file())
+            self.assertTrue((installed / "scripts" / "remote_github_setup.py").is_file())
+            self.assertTrue((installed / "references" / "github.md").is_file())
             self.assertFalse((installed / "tests").exists())
             self.assertFalse((installed / ".git").exists())
 

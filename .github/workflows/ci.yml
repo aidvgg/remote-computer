@@ -3,6 +3,7 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -10,21 +11,40 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
       - name: Install validator dependency
         run: python -m pip install --disable-pip-version-check PyYAML
       - name: Type-check Python
+        if: matrix.python-version == '3.12'
         run: npx --yes pyright@1.1.413 --level error
       - name: Check shell syntax
         run: sh -n install-skill.sh
       - name: Run tests
-        run: python -m unittest discover -s tests -v
+        run: python -B -m unittest discover -s tests -v
       - name: Validate skill metadata
-        run: python scripts/quick_validate.py .
+        run: python -B scripts/quick_validate.py .
+      - name: Verify packaged skill
+        shell: bash
+        run: |
+          skills_dir="$(mktemp -d)"
+          SOURCE_DIR="$GITHUB_WORKSPACE" SKILLS_DIR="$skills_dir" AGENT=codex sh install-skill.sh
+          installed="$skills_dir/remote-computer"
+          python -B scripts/quick_validate.py "$installed"
+          diff -ru SKILL.md "$installed/SKILL.md"
+          diff -ru agents "$installed/agents"
+          diff -ru scripts "$installed/scripts"
+          diff -ru references "$installed/references"
+          test ! -e "$installed/tests"
+          test ! -e "$installed/.git"
