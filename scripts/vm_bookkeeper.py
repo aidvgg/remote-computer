@@ -37,16 +37,47 @@ class VMRecord(TypedDict):
     checked_at: str
 
 
-class Registry(TypedDict):
+class GithubKeyPair(TypedDict):
+    private_path: str
+    public_path: str
+
+
+class GithubInstall(TypedDict):
+    provider: str
+    id: str
+    remote_private_path: str
+    remote_public_path: str
+    configured_at: str
+
+
+class GithubAuthRecord(TypedDict):
+    host: str
+    account: str
+    key_pair: GithubKeyPair
+    source: str
+    fingerprint: str
+    title: str
+    created_at: str
+    installed_on: list[GithubInstall]
+
+
+class RegistryRequired(TypedDict):
     version: int
     created_at: str
     updated_at: str
     vms: list[VMRecord]
 
 
+class Registry(RegistryRequired, total=False):
+    github_auth: list[GithubAuthRecord]
+
+
 SCHEMA_VERSION = 1
 VALID_PROVIDERS = {"aws", "gcp"}
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$")
+GITHUB_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$")
+GITHUB_SOURCE_VALUES = {"discovered", "generated"}
+GITHUB_SSH_GREETING_RE = re.compile(r"Hi ([A-Za-z0-9][A-Za-z0-9._-]{0,62})! You've successfully authenticated")
 
 
 def now() -> str:
@@ -79,6 +110,39 @@ def validate_registry(data: object) -> Registry:
         vm_id = item.get("id")
         if provider not in VALID_PROVIDERS or not isinstance(vm_id, str) or not vm_id:
             raise ValueError("every VM needs a valid provider and non-empty id")
+    raw_github = raw.get("github_auth")
+    if raw_github is not None:
+        if not isinstance(raw_github, list):
+            raise ValueError("registry field 'github_auth' must be an array when present")
+        identities: set[tuple[str, str]] = set()
+        for raw_item in cast(list[object], raw_github):
+            if not isinstance(raw_item, dict):
+                raise ValueError("every GitHub auth record must be an object")
+            item = cast(dict[str, object], raw_item)
+            host = item.get("host")
+            account = item.get("account")
+            source = item.get("source")
+            fingerprint = item.get("fingerprint")
+            pair = item.get("key_pair")
+            installs = item.get("installed_on")
+            if not isinstance(host, str) or not GITHUB_HOST_RE.fullmatch(host):
+                raise ValueError("every GitHub auth record needs a valid host")
+            if not isinstance(account, str) or not NAME_RE.fullmatch(account):
+                raise ValueError("every GitHub auth record needs a valid account")
+            if (host, account) in identities:
+                raise ValueError("GitHub auth host/account pairs must be unique")
+            identities.add((host, account))
+            if source not in GITHUB_SOURCE_VALUES:
+                raise ValueError("GitHub auth source must be discovered or generated")
+            if not isinstance(fingerprint, str) or not fingerprint.startswith("SHA256:"):
+                raise ValueError("every GitHub auth record needs an SHA256 fingerprint")
+            if not isinstance(pair, dict):
+                raise ValueError("every GitHub auth record needs a key_pair object")
+            pair_dict = cast(dict[str, object], pair)
+            if not all(isinstance(pair_dict.get(field), str) and pair_dict.get(field) for field in ("private_path", "public_path")):
+                raise ValueError("GitHub key_pair paths must be non-empty strings")
+            if not isinstance(installs, list):
+                raise ValueError("every GitHub auth record needs an installed_on array")
     return cast(Registry, raw)
 
 
@@ -116,6 +180,162 @@ def save_registry(path: Path, data: Registry) -> None:
 
 def command_path(name: str) -> str | None:
     return shutil.which(name)
+
+
+def run_text(command: list[str], timeout: int = 30, input_text: str | None = None) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        command,
+        input=input_text,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=timeout,
+    )
+
+
+def checked_text(command: list[str], timeout: int = 30, input_text: str | None = None) -> str:
+    result = run_text(command, timeout=timeout, input_text=input_text)
+    if result.returncode:
+        message = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+        raise RuntimeError(message)
+    return result.stdout.strip()
+
+
+def ssh_fingerprint(path: Path) -> str:
+    output = checked_text(["ssh-keygen", "-lf", str(path)])
+    parts = output.split()
+    if len(parts) < 2 or not parts[1].startswith("SHA256:"):
+        raise RuntimeError(f"could not parse SSH fingerprint for {path}")
+    return parts[1]
+
+
+def ssh_text_fingerprint(public_key: str) -> str:
+    output = checked_text(["ssh-keygen", "-lf", "-"], input_text=f"{public_key.strip()}\n")
+    parts = output.split()
+    if len(parts) < 2 or not parts[1].startswith("SHA256:"):
+        raise RuntimeError("could not parse an SSH public-key fingerprint")
+    return parts[1]
+
+
+def validate_github_identity(host: str, account: str) -> None:
+    if not GITHUB_HOST_RE.fullmatch(host):
+        raise ValueError("GitHub host must be a valid DNS name")
+    if not NAME_RE.fullmatch(account):
+        raise ValueError("GitHub account must use 1-63 letters, digits, dots, underscores, or hyphens")
+
+
+def github_records(data: Registry, create: bool = False) -> list[GithubAuthRecord]:
+    records = data.get("github_auth")
+    if records is None:
+        if not create:
+            return []
+        records = []
+        data["github_auth"] = records
+    return records
+
+
+def github_record(data: Registry, host: str, account: str) -> tuple[int, GithubAuthRecord] | None:
+    for index, record in enumerate(github_records(data)):
+        if record["host"] == host and record["account"] == account:
+            return index, record
+    return None
+
+
+def git_config_value(name: str) -> str | None:
+    if not command_path("git"):
+        return None
+    result = run_text(["git", "config", "--global", "--get", name], timeout=10)
+    value = result.stdout.strip()
+    return value if result.returncode == 0 and value else None
+
+
+def gh_status(host: str) -> dict[str, object]:
+    executable = command_path("gh")
+    result: dict[str, object] = {"installed": bool(executable), "path": executable, "accounts": []}
+    if not executable:
+        return result
+    status = run_text([executable, "auth", "status", "--hostname", host, "--json", "hosts"], timeout=20)
+    try:
+        payload: object = json.loads(status.stdout) if status.stdout.strip() else {}
+    except json.JSONDecodeError:
+        result["error"] = status.stderr.strip() or "gh returned invalid status JSON"
+        return result
+    accounts: list[dict[str, object]] = []
+    if isinstance(payload, dict):
+        raw_hosts = cast(dict[str, object], payload).get("hosts")
+        if isinstance(raw_hosts, dict):
+            raw_accounts = cast(dict[str, object], raw_hosts).get(host, [])
+            if isinstance(raw_accounts, list):
+                for raw_account in cast(list[object], raw_accounts):
+                    if not isinstance(raw_account, dict):
+                        continue
+                    account = cast(dict[str, object], raw_account)
+                    accounts.append({
+                        "login": account.get("login"),
+                        "active": bool(account.get("active")),
+                        "state": account.get("state"),
+                        "git_protocol": account.get("gitProtocol"),
+                    })
+    result["accounts"] = accounts
+    if status.returncode and not accounts:
+        result["error"] = status.stderr.strip() or "gh authentication is unavailable"
+    return result
+
+
+def object_dicts(value: object) -> list[dict[str, object]]:
+    if not isinstance(value, list):
+        return []
+    return [
+        cast(dict[str, object], item)
+        for item in cast(list[object], value)
+        if isinstance(item, dict)
+    ]
+
+
+def github_registered_fingerprints(host: str, status: dict[str, object]) -> tuple[set[str], str]:
+    executable = status.get("path")
+    accounts = object_dicts(status.get("accounts", []))
+    if not isinstance(executable, str) or not executable:
+        return set(), "gh-unavailable"
+    if not any(item.get("state") == "success" for item in accounts):
+        return set(), "gh-not-authenticated"
+    response = run_text([
+        executable, "api", "--hostname", host, "user/keys",
+        "--paginate", "--jq", ".[].key",
+    ], timeout=30)
+    if response.returncode:
+        return set(), "github-key-query-failed"
+    fingerprints: set[str] = set()
+    for key in response.stdout.splitlines():
+        if not key.strip():
+            continue
+        try:
+            fingerprints.add(ssh_text_fingerprint(key))
+        except RuntimeError:
+            continue
+    return fingerprints, "ok"
+
+
+def github_ssh_login(output: str) -> str | None:
+    match = GITHUB_SSH_GREETING_RE.search(output)
+    return match.group(1) if match else None
+
+
+def verify_github_ssh(private: Path, host: str) -> tuple[str | None, str | None]:
+    result = run_text([
+        "ssh", "-T",
+        "-o", "BatchMode=yes",
+        "-o", "IdentitiesOnly=yes",
+        "-o", "ConnectTimeout=10",
+        "-o", "StrictHostKeyChecking=yes",
+        "-i", str(private),
+        f"git@{host}",
+    ], timeout=15)
+    combined = "\n".join(part for part in (result.stdout.strip(), result.stderr.strip()) if part)
+    login = github_ssh_login(combined)
+    if login:
+        return login, None
+    return None, combined or f"ssh exited with status {result.returncode}"
 
 
 def clipboard_tool() -> tuple[str, list[str]] | None:
@@ -203,6 +423,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         "platform": platform.system().lower(),
         "aws": {"installed": bool(command_path("aws")), "path": command_path("aws")},
         "gcp": {"installed": bool(command_path("gcloud")), "path": command_path("gcloud")},
+        "git": {"installed": bool(command_path("git")), "path": command_path("git")},
+        "gh": {"installed": bool(command_path("gh")), "path": command_path("gh")},
+        "gpg": {"installed": bool(command_path("gpg")), "path": command_path("gpg")},
+        "scp": {"installed": bool(command_path("scp")), "path": command_path("scp")},
         "ssh_keygen": {"installed": bool(command_path("ssh-keygen")), "path": command_path("ssh-keygen")},
         "clipboard": {"available": bool(clip), "tool": clip[0] if clip else None},
     }
@@ -237,6 +461,400 @@ def cmd_create_key(args: argparse.Namespace) -> int:
     os.chmod(private, 0o600)
     os.chmod(public, 0o644)
     print(json.dumps({"private_key": str(private), "public_key": str(public)}, sort_keys=True))
+    return 0
+
+
+def cmd_github_discover(args: argparse.Namespace) -> int:
+    host = str(args.host)
+    if not GITHUB_HOST_RE.fullmatch(host):
+        raise ValueError("GitHub host must be a valid DNS name")
+    status = gh_status(host)
+    registered_fingerprints, registration_check = github_registered_fingerprints(host, status)
+
+    configured_identities: set[Path] = set()
+    if command_path("ssh"):
+        ssh_config = run_text(["ssh", "-G", f"git@{host}"], timeout=10)
+        if ssh_config.returncode == 0:
+            for line in ssh_config.stdout.splitlines():
+                field, _, value = line.partition(" ")
+                if field.lower() == "identityfile" and value:
+                    configured_identities.add(Path(value).expanduser())
+
+    agent_fingerprints: set[str] = set()
+    if command_path("ssh-add"):
+        agent = run_text(["ssh-add", "-l"], timeout=10)
+        if agent.returncode == 0:
+            for line in agent.stdout.splitlines():
+                parts = line.split()
+                if len(parts) >= 2 and parts[1].startswith("SHA256:"):
+                    agent_fingerprints.add(parts[1])
+
+    candidates: list[dict[str, object]] = []
+    ssh_dir = Path.home() / ".ssh"
+    if command_path("ssh-keygen") and ssh_dir.is_dir():
+        for public in sorted(ssh_dir.rglob("*.pub")):
+            private = Path(str(public)[:-4])
+            if not private.is_file():
+                continue
+            try:
+                fingerprint = ssh_fingerprint(public)
+            except RuntimeError:
+                continue
+            candidate: dict[str, object] = {
+                "private_path": str(private.resolve()),
+                "public_path": str(public.resolve()),
+                "fingerprint": fingerprint,
+                "configured_for_host": private.expanduser() in configured_identities,
+                "loaded_in_agent": fingerprint in agent_fingerprints,
+                "registered_with_github": fingerprint in registered_fingerprints if registration_check == "ok" else None,
+                "verified_account": None,
+            }
+            if args.verify_ssh:
+                login, error = verify_github_ssh(private, host)
+                candidate["verified_account"] = login
+                if error and "Host key verification failed" in error:
+                    candidate["verification_error"] = "host-key-not-known"
+                elif error:
+                    candidate["verification_error"] = "authentication-failed"
+            candidates.append(candidate)
+
+    signing_key = git_config_value("user.signingkey")
+    gpg_info: dict[str, object] = {
+        "program": git_config_value("gpg.program"),
+        "format": git_config_value("gpg.format") or "openpgp",
+        "signing_key": signing_key,
+        "commit_gpgsign": git_config_value("commit.gpgsign"),
+        "secret_key_present": False,
+        "fingerprint": None,
+        "uid": None,
+    }
+    if signing_key and command_path("gpg"):
+        secret = run_text(["gpg", "--batch", "--with-colons", "--list-secret-keys", signing_key], timeout=20)
+        if secret.returncode == 0:
+            for line in secret.stdout.splitlines():
+                fields = line.split(":")
+                if fields[0] == "sec":
+                    gpg_info["secret_key_present"] = True
+                elif fields[0] == "fpr" and not gpg_info["fingerprint"]:
+                    gpg_info["fingerprint"] = fields[9]
+                elif fields[0] == "uid" and not gpg_info["uid"]:
+                    gpg_info["uid"] = fields[9]
+        else:
+            gpg_info["error"] = secret.stderr.strip() or "GPG secret-key discovery failed"
+
+    shared: list[dict[str, object]] = []
+    path = registry_path(args.registry)
+    if path.exists():
+        data = load_registry(path)
+        shared = [
+            {
+                "host": record["host"],
+                "account": record["account"],
+                "fingerprint": record["fingerprint"],
+                "private_path": record["key_pair"]["private_path"],
+                "public_path": record["key_pair"]["public_path"],
+                "installed_vm_count": len(record["installed_on"]),
+            }
+            for record in github_records(data)
+        ]
+
+    registered_candidates = [
+        candidate for candidate in candidates
+        if candidate["registered_with_github"] is True or candidate["verified_account"]
+    ]
+    if shared:
+        recommendation = "reuse-registered-shared-key"
+    elif registered_candidates:
+        recommendation = "confirm-and-register-existing-key"
+    elif any(item.get("state") == "success" for item in object_dicts(status.get("accounts", []))):
+        recommendation = "create-shared-key-and-upload-with-local-gh"
+    else:
+        recommendation = "authenticate-gh-then-create-shared-key"
+
+    result = {
+        "host": host,
+        "git": {
+            "user_name": git_config_value("user.name"),
+            "user_email": git_config_value("user.email"),
+            "credential_helper": git_config_value("credential.helper"),
+        },
+        "gpg": gpg_info,
+        "gh": status,
+        "ssh": {
+            "registration_check": registration_check,
+            "candidates": candidates,
+        },
+        "shared_registry_keys": shared,
+        "recommendation": recommendation,
+    }
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
+def store_github_record(
+    data: Registry,
+    host: str,
+    account: str,
+    private: Path,
+    public: Path,
+    source: str,
+    fingerprint: str,
+    title: str,
+) -> str:
+    existing = github_record(data, host, account)
+    if existing:
+        _, record = existing
+        if record["fingerprint"] != fingerprint:
+            raise ValueError(f"refusing to replace the registered GitHub key for {account}@{host}")
+        record["key_pair"] = {
+            "private_path": str(private.resolve()),
+            "public_path": str(public.resolve()),
+        }
+        record["source"] = source
+        record["title"] = title
+        return "updated"
+    github_records(data, create=True).append({
+        "host": host,
+        "account": account,
+        "key_pair": {
+            "private_path": str(private.resolve()),
+            "public_path": str(public.resolve()),
+        },
+        "source": source,
+        "fingerprint": fingerprint,
+        "title": title,
+        "created_at": now(),
+        "installed_on": [],
+    })
+    return "created"
+
+
+def cmd_github_register_key(args: argparse.Namespace) -> int:
+    host = str(args.host)
+    account = str(args.account)
+    validate_github_identity(host, account)
+    private = Path(args.private_key).expanduser()
+    public = Path(args.public_key).expanduser()
+    if not private.is_file() or not public.is_file():
+        raise FileNotFoundError("GitHub private and public key paths must both exist")
+    private_fingerprint = ssh_fingerprint(private)
+    public_fingerprint = ssh_fingerprint(public)
+    if private_fingerprint != public_fingerprint:
+        raise ValueError("GitHub private and public key fingerprints do not match")
+    path = registry_path(args.registry)
+    data = load_registry(path, create=True)
+    action = store_github_record(
+        data, host, account, private, public, "discovered", public_fingerprint, str(args.title)
+    )
+    save_registry(path, data)
+    print(json.dumps({
+        "action": action,
+        "account": account,
+        "host": host,
+        "fingerprint": public_fingerprint,
+        "path": str(path),
+    }, sort_keys=True))
+    return 0
+
+
+def cmd_github_create_key(args: argparse.Namespace) -> int:
+    host = str(args.host)
+    account = str(args.account)
+    validate_github_identity(host, account)
+    if not command_path("ssh-keygen"):
+        raise RuntimeError("ssh-keygen is required")
+    path = registry_path(args.registry)
+    data = load_registry(path, create=True)
+    if github_record(data, host, account):
+        raise FileExistsError(f"a shared GitHub key is already registered for {account}@{host}")
+    private = (
+        Path(args.path).expanduser()
+        if args.path
+        else Path.home() / ".ssh" / "remote-computer" / "github" / f"{host}-{account}"
+    )
+    public = Path(f"{private}.pub")
+    if private.exists() or public.exists():
+        raise FileExistsError(f"refusing to overwrite existing key: {private}")
+    private.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(private.parent, 0o700)
+    result = run_text([
+        "ssh-keygen", "-q", "-t", "ed25519", "-N", "",
+        "-C", f"remote-computer-github:{account}@{host}", "-f", str(private),
+    ])
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or "ssh-keygen failed")
+    os.chmod(private, 0o600)
+    os.chmod(public, 0o644)
+    fingerprint = ssh_fingerprint(public)
+    store_github_record(data, host, account, private, public, "generated", fingerprint, str(args.title))
+    save_registry(path, data)
+    print(json.dumps({
+        "action": "created",
+        "account": account,
+        "host": host,
+        "fingerprint": fingerprint,
+        "private_key": str(private),
+        "public_key": str(public),
+        "registry": str(path),
+    }, sort_keys=True))
+    return 0
+
+
+def cmd_github_upload_key(args: argparse.Namespace) -> int:
+    host = str(args.host)
+    account = str(args.account)
+    validate_github_identity(host, account)
+    path = registry_path(args.registry)
+    data = load_registry(path, create=False)
+    found = github_record(data, host, account)
+    if not found:
+        raise ValueError(f"no shared GitHub key is registered for {account}@{host}")
+    _, auth = found
+    public = Path(auth["key_pair"]["public_path"]).expanduser()
+    if not public.is_file():
+        raise FileNotFoundError(f"registered GitHub public key does not exist: {public}")
+    if ssh_fingerprint(public) != auth["fingerprint"]:
+        raise ValueError("registered GitHub public key fingerprint no longer matches its file")
+
+    status = gh_status(host)
+    executable = status.get("path")
+    accounts = object_dicts(status.get("accounts", []))
+    matching_account = any(
+        item.get("login") == account
+        and item.get("active") is True
+        and item.get("state") == "success"
+        for item in accounts
+    )
+    if not isinstance(executable, str) or not executable:
+        raise RuntimeError("gh is required to upload the GitHub public key")
+    if not matching_account:
+        raise RuntimeError(f"gh must be actively authenticated as {account} on {host}")
+
+    fingerprints, check = github_registered_fingerprints(host, status)
+    if check != "ok":
+        raise RuntimeError(f"could not inspect GitHub SSH keys: {check}")
+    action = "already-present"
+    if auth["fingerprint"] not in fingerprints:
+        checked_text([
+            executable, "ssh-key", "add", str(public),
+            "--type", "authentication", "--title", auth["title"],
+        ], timeout=45)
+        action = "uploaded"
+        fingerprints, check = github_registered_fingerprints(host, status)
+        if check != "ok" or auth["fingerprint"] not in fingerprints:
+            raise RuntimeError("GitHub did not return the uploaded SSH key fingerprint")
+    print(json.dumps({
+        "account": account,
+        "action": action,
+        "fingerprint": auth["fingerprint"],
+        "host": host,
+        "verified": True,
+    }, sort_keys=True))
+    return 0
+
+
+def checked_subprocess(command: list[str], timeout: int = 45, input_text: str | None = None) -> str:
+    return checked_text(command, timeout=timeout, input_text=input_text)
+
+
+def cmd_github_install_key(args: argparse.Namespace) -> int:
+    host = str(args.host)
+    account = str(args.account)
+    validate_github_identity(host, account)
+    path = registry_path(args.registry)
+    data = load_registry(path, create=False)
+    found = github_record(data, host, account)
+    if not found:
+        raise ValueError(f"no shared GitHub key is registered for {account}@{host}")
+    _, auth = found
+    provider = str(args.provider)
+    vm_id = str(args.id)
+    vm = next((record for record in data["vms"] if record["provider"] == provider and record["id"] == vm_id), None)
+    if vm is None:
+        raise ValueError(f"VM not found in registry: {provider}/{vm_id}")
+    private = Path(auth["key_pair"]["private_path"]).expanduser()
+    public = Path(auth["key_pair"]["public_path"]).expanduser()
+    if not private.is_file() or not public.is_file():
+        raise FileNotFoundError("registered GitHub key paths must both exist")
+    if ssh_fingerprint(private) != auth["fingerprint"] or ssh_fingerprint(public) != auth["fingerprint"]:
+        raise ValueError("registered GitHub key fingerprint no longer matches its files")
+    for executable in ("ssh", "scp"):
+        if not command_path(executable):
+            raise RuntimeError(f"{executable} is required")
+
+    access_path = Path(vm["key_pair"]["private_path"]).expanduser()
+    if not access_path.is_file():
+        raise FileNotFoundError(f"VM access key does not exist: {access_path}")
+    if not vm["public_ip"]:
+        raise ValueError(f"VM has no public IP: {provider}/{vm_id}")
+    access_key = str(access_path)
+    target = f"{vm['ssh_user']}@{vm['public_ip']}"
+    common = [
+        "-o", "IdentitiesOnly=yes",
+        "-o", "BatchMode=yes",
+        "-o", "ConnectTimeout=15",
+        "-o", "StrictHostKeyChecking=accept-new",
+        "-i", access_key,
+    ]
+    fingerprint_slug = re.sub(r"[^A-Za-z0-9]", "", auth["fingerprint"].removeprefix("SHA256:"))[:16]
+    remote_name = f"{host}-{account}-{fingerprint_slug}"
+    remote_private = f".ssh/remote-computer/github/{remote_name}"
+    remote_public = f"{remote_private}.pub"
+    checked_subprocess(["ssh", *common, target, "install -d -m 700 ~/.ssh/remote-computer/github"])
+    prior_install = next((
+        item for item in auth["installed_on"]
+        if item["provider"] == provider and item["id"] == vm_id
+    ), None)
+    if prior_install is None:
+        preflight = (
+            f"if test -e ~/{remote_private} || test -e ~/{remote_public}; "
+            "then echo 'refusing to overwrite an untracked remote GitHub key' >&2; exit 1; fi"
+        )
+        checked_subprocess(["ssh", *common, target, preflight])
+        checked_subprocess(["scp", *common, str(private), f"{target}:{remote_private}"])
+        checked_subprocess(["scp", *common, str(public), f"{target}:{remote_public}"])
+    else:
+        remote_private = prior_install["remote_private_path"].removeprefix("~/")
+        remote_public = prior_install["remote_public_path"].removeprefix("~/")
+
+    setup_script = Path(__file__).with_name("remote_github_setup.py")
+    if not setup_script.is_file():
+        raise FileNotFoundError(f"remote setup helper does not exist: {setup_script}")
+    setup_output = checked_subprocess([
+        "ssh", *common, target, "python3", "-",
+        "--host", host,
+        "--account", account,
+        "--private-key", remote_private,
+        "--public-key", remote_public,
+        "--fingerprint", auth["fingerprint"],
+    ], input_text=setup_script.read_text(encoding="utf-8"))
+
+    configured_at = now()
+    installation: GithubInstall = {
+        "provider": provider,
+        "id": vm_id,
+        "remote_private_path": f"~/{remote_private}",
+        "remote_public_path": f"~/{remote_public}",
+        "configured_at": configured_at,
+    }
+    install_index = next((
+        index for index, item in enumerate(auth["installed_on"])
+        if item["provider"] == provider and item["id"] == vm_id
+    ), None)
+    if install_index is None:
+        auth["installed_on"].append(installation)
+    else:
+        auth["installed_on"][install_index] = installation
+    save_registry(path, data)
+    print(json.dumps({
+        "account": account,
+        "host": host,
+        "fingerprint": auth["fingerprint"],
+        "provider": provider,
+        "id": vm_id,
+        "remote_setup": json.loads(setup_output),
+        "registry": str(path),
+    }, indent=2, sort_keys=True))
     return 0
 
 
@@ -325,7 +943,7 @@ def cmd_copy_ssh(args: argparse.Namespace) -> int:
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description=__doc__)
     sub = root.add_subparsers(dest="subcommand", required=True)
-    doctor = sub.add_parser("doctor", help="detect cloud CLIs, ssh-keygen, and clipboard support")
+    doctor = sub.add_parser("doctor", help="detect cloud, GitHub, SSH, GPG, and clipboard tooling")
     doctor.set_defaults(func=cmd_doctor)
 
     init = sub.add_parser("init", help="create or validate the VM registry")
@@ -336,6 +954,62 @@ def parser() -> argparse.ArgumentParser:
     key.add_argument("--name", required=True)
     key.add_argument("--path")
     key.set_defaults(func=cmd_create_key)
+
+    github_discover = sub.add_parser(
+        "github-discover",
+        help="inspect local Git, GPG, gh, and SSH configuration without exposing credentials",
+    )
+    github_discover.add_argument("--registry")
+    github_discover.add_argument("--host", default="github.com")
+    github_discover.add_argument(
+        "--verify-ssh",
+        action="store_true",
+        help="probe candidate keys with strict host verification and report the authenticated account",
+    )
+    github_discover.set_defaults(func=cmd_github_discover)
+
+    github_register = sub.add_parser(
+        "github-register-key",
+        help="register an existing shared GitHub SSH key pair by path and fingerprint",
+    )
+    github_register.add_argument("--registry")
+    github_register.add_argument("--host", default="github.com")
+    github_register.add_argument("--account", required=True)
+    github_register.add_argument("--private-key", required=True)
+    github_register.add_argument("--public-key", required=True)
+    github_register.add_argument("--title", required=True)
+    github_register.set_defaults(func=cmd_github_register_key)
+
+    github_create = sub.add_parser(
+        "github-create-key",
+        help="create and register a shared GitHub Ed25519 authentication key",
+    )
+    github_create.add_argument("--registry")
+    github_create.add_argument("--host", default="github.com")
+    github_create.add_argument("--account", required=True)
+    github_create.add_argument("--title", required=True)
+    github_create.add_argument("--path")
+    github_create.set_defaults(func=cmd_github_create_key)
+
+    github_upload = sub.add_parser(
+        "github-upload-key",
+        help="upload a registered public key with gh and verify its fingerprint",
+    )
+    github_upload.add_argument("--registry")
+    github_upload.add_argument("--host", default="github.com")
+    github_upload.add_argument("--account", required=True)
+    github_upload.set_defaults(func=cmd_github_upload_key)
+
+    github_install = sub.add_parser(
+        "github-install-key",
+        help="securely install a registered shared GitHub key on one registered VM",
+    )
+    github_install.add_argument("--registry")
+    github_install.add_argument("--host", default="github.com")
+    github_install.add_argument("--account", required=True)
+    github_install.add_argument("--provider", choices=sorted(VALID_PROVIDERS), required=True)
+    github_install.add_argument("--id", required=True)
+    github_install.set_defaults(func=cmd_github_install_key)
 
     upsert = sub.add_parser("upsert", help="create or replace one registry record")
     upsert.add_argument("--registry")

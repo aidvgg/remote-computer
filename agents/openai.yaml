@@ -1,4 +1,4 @@
 interface:
   display_name: "Remote Computer"
-  short_description: "Provision tracked AWS or GCP development VMs"
-  default_prompt: "Use $remote-computer to provision a remote development VM and prepare SSH access."
+  short_description: "Provision cloud VMs with GitHub-ready access"
+  default_prompt: "Use $remote-computer to provision a tracked cloud development VM and optionally port GitHub authentication and commit signing."
